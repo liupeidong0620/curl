@@ -3,7 +3,9 @@ sudo: required
 cache:
     directories:
         - $HOME/libpsl-0.20.1
+        - $HOME/mbedtls-mbedtls-2.8.0
         - $HOME/libidn2-2.0.4
+        - $HOME/wolfssl-3.14.0-stable
 
 env:
     global:
@@ -32,14 +34,15 @@ addons:
             - libssh-dev
             - krb5-user
             - autopoint  # for libpsl that needs autoreconf that uses gettext that needs it
-            - libunistring-dev # for libidn2 neeed by libpsl
+            - libunistring-dev # for libidn2 needed by libpsl
+            - libnss3-dev
 
 matrix:
     include:
         - os: linux
           compiler: gcc
           dist: trusty
-          env: T=normal C="--with-gssapi"
+          env: T=normal C="--with-gssapi --with-libssh2"
         - os: linux
           compiler: gcc
           dist: trusty
@@ -59,18 +62,30 @@ matrix:
         - os: linux
           compiler: gcc
           dist: trusty
-          env: T=novalgrind BORINGSSL=yes -C="--with-ssl=$HOME/boringssl" LD_LIBRARY_PATH=/home/travis/boringssl/lib:/usr/local/lib
+          env: T=novalgrind BORINGSSL=yes C="--with-ssl=$HOME/boringssl" LD_LIBRARY_PATH=/home/travis/boringssl/lib:/usr/local/lib
+        - os: linux
+          compiler: gcc
+          dist: trusty
+          env: T=debug-wolfssl C="--with-wolfssl --without-ssl"
         - os: linux
           compiler: clang
           dist: trusty
           env: T=debug
+        - os: linux
+          compiler: clang
+          dist: trusty
+          env: T=debug C="--with-mbedtls --without-ssl"
+        - os: linux
+          compiler: clang
+          dist: trusty
+          env: T=debug C="--with-nss --without-ssl" NOTESTS=1 CPPFLAGS="-isystem /usr/include/nss"
         - os: linux
           compiler: gcc
           dist: trusty
           env: T=iconv
         - os: osx
           compiler: gcc
-          env: T=debug
+          env: T=debug C=--with-libssh2
         - os: osx
           compiler: gcc
           env: T=debug C=--enable-ares
@@ -176,8 +191,34 @@ before_script:
       fi
     - |
       if [ $TRAVIS_OS_NAME = linux ]; then
+        if [ ! -e $HOME/mbedtls-mbedtls-2.8.0/library/libmbedtls.a ]; then
+          (cd $HOME && \
+          curl -LO https://github.com/ARMmbed/mbedtls/archive/mbedtls-2.8.0.tar.gz && \
+          tar -xzf mbedtls-2.8.0.tar.gz && \
+          cd mbedtls-mbedtls-2.8.0 && \
+          cmake . -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_C_FLAGS=-fPIC && \
+          make)
+        fi
+      fi
+    - |
+      if [ $TRAVIS_OS_NAME = linux ]; then
+        if [ ! -e $HOME/wolfssl-3.14.0-stable/Makefile ]; then
+          (cd $HOME && \
+          curl -LO https://github.com/wolfSSL/wolfssl/archive/v3.14.0-stable.tar.gz && \
+          tar -xzf v3.14.0-stable.tar.gz && \
+          cd wolfssl-3.14.0-stable && \
+          ./autogen.sh && \
+          ./configure --enable-tls13 --enable-all && \
+          touch wolfssl/wolfcrypt/fips.h && \
+          make)
+        fi
+      fi
+    - |
+      if [ $TRAVIS_OS_NAME = linux ]; then
         (cd $HOME/libidn2-2.0.4 && sudo make install)
         (cd $HOME/libpsl-0.20.1 && sudo make install)
+        (cd $HOME/mbedtls-mbedtls-2.8.0 && sudo make install)
+        (cd $HOME/wolfssl-3.14.0-stable && sudo make install)
       fi
 
 script:
@@ -189,8 +230,8 @@ script:
              ./configure --enable-debug --disable-shared --enable-code-coverage
              make
              make TFLAGS=-n test-nonflaky
-             tests="1 2 3 4 5 6 7 8 9 10 200 201 202 300 301 302 500 501 502 503 504 506 507 508 509 510 511 512 513 514 515 516 517 518 519 600 601 800 801 802 803 900 901 902 903 1000 1001 1002 1004 1302 1303 1304 1305 1306 1308 1400 1401 1402 1404 1450 1451 1452 1502 1507 1508 1600 1602 1603 1605"
-             make "TFLAGS=-n -e $tests" test-nonflaky
+             make "TFLAGS=-n -e" test-nonflaky
+             tests="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 200 201 202 300 301 302 500 501 502 503 504 506 507 508 509 510 511 512 513 514 515 516 517 518 519 600 601 700 701 702 800 801 802 803 900 901 902 903 1000 1001 1002 1004 1100 1101 1200 1201 1302 1303 1304 1305 1306 1308 1400 1401 1402 1404 1450 1451 1452 1502 1507 1508 1600 1602 1603 1605 1700 1701 1702 2001 3000"
              make "TFLAGS=-n -t $tests" test-nonflaky
              coveralls --gcov /usr/bin/gcov-7 --gcov-options '\-lp' -i src -e lib -e tests -e docs -b $PWD/src
              coveralls --gcov /usr/bin/gcov-7 --gcov-options '\-lp' -e src -i lib -e tests -e docs -b $PWD/lib
@@ -200,7 +241,16 @@ script:
         if [ "$T" = "debug" ]; then
              ./configure --enable-debug --enable-werror $C
              make && make examples
-             make TFLAGS=-n test-nonflaky
+             if [ -z $NOTESTS ]; then
+                make TFLAGS=-n test-nonflaky
+             fi
+        fi
+    - |
+        set -eo pipefail
+        if [ "$T" = "debug-wolfssl" ]; then
+             ./configure --enable-debug --enable-werror $C
+             make
+             make "TFLAGS=-n !311 !313" test-nonflaky
         fi
     - |
         set -eo pipefail

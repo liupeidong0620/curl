@@ -108,6 +108,7 @@ static int http2_perform_getsock(const struct connectdata *conn,
                                  int numsocks)
 {
   const struct http_conn *c = &conn->proto.httpc;
+  struct SingleRequest *k = &conn->data->req;
   int bitmap = GETSOCK_BLANK;
   (void)numsocks;
 
@@ -119,7 +120,9 @@ static int http2_perform_getsock(const struct connectdata *conn,
      always be ready for one */
   bitmap |= GETSOCK_READSOCK(FIRSTSOCKET);
 
-  if(nghttp2_session_want_write(c->h2))
+  /* we're still uploading or the HTTP/2 layer wants to send data */
+  if(((k->keepon & (KEEP_SEND|KEEP_SEND_PAUSE)) == KEEP_SEND) ||
+     nghttp2_session_want_write(c->h2))
     bitmap |= GETSOCK_WRITESOCK(FIRSTSOCKET);
 
   return bitmap;
@@ -162,6 +165,7 @@ static CURLcode http2_disconnect(struct connectdata *conn,
   nghttp2_session_del(c->h2);
   Curl_safefree(c->inbuf);
   http2_stream_free(conn->data->req.protop);
+  conn->data->state.drain = 0;
 
   H2BUGF(infof(conn->data, "HTTP/2 DISCONNECT done\n"));
 
@@ -201,8 +205,11 @@ static bool http2_connisdead(struct connectdata *conn)
          only "protocol frames" */
       CURLcode result;
       struct http_conn *httpc = &conn->proto.httpc;
-      ssize_t nread = ((Curl_recv *)httpc->recv_underlying)(
-        conn, FIRSTSOCKET, httpc->inbuf, H2_BUFSIZE, &result);
+      ssize_t nread = -1;
+      if(httpc->recv_underlying)
+        /* if called "too early", this pointer isn't setup yet! */
+        nread = ((Curl_recv *)httpc->recv_underlying)(
+          conn, FIRSTSOCKET, httpc->inbuf, H2_BUFSIZE, &result);
       if(nread != -1) {
         infof(conn->data,
               "%d bytes stray data read before trying h2 connection\n",
@@ -338,7 +345,7 @@ const char *Curl_http2_strerror(uint32_t err)
     "INADEQUATE_SECURITY",  /* 0xC */
     "HTTP_1_1_REQUIRED"     /* 0xD */
   };
-  return (err < sizeof str / sizeof str[0]) ? str[err] : "unknown";
+  return (err < sizeof(str) / sizeof(str[0])) ? str[err] : "unknown";
 #else
   return nghttp2_http2_strerror(err);
 #endif
@@ -552,7 +559,6 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
   struct http_conn *httpc = &conn->proto.httpc;
   struct Curl_easy *data_s = NULL;
   struct HTTP *stream = NULL;
-  static int lastStream = -1;
   int rv;
   size_t left, ncopy;
   int32_t stream_id = frame->hd.stream_id;
@@ -575,7 +581,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
       if(max_conn != httpc->settings.max_concurrent_streams) {
         /* only signal change if the value actually changed */
         infof(conn->data,
-              "Connection state changed (MAX_CONCURRENT_STREAMS == %d)!\n",
+              "Connection state changed (MAX_CONCURRENT_STREAMS == %u)!\n",
               httpc->settings.max_concurrent_streams);
         Curl_multi_connchanged(conn->data->multi);
       }
@@ -583,9 +589,6 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
     return 0;
   }
   data_s = nghttp2_session_get_stream_user_data(session, stream_id);
-  if(lastStream != stream_id) {
-    lastStream = stream_id;
-  }
   if(!data_s) {
     H2BUGF(infof(conn->data,
                  "No Curl_easy associated with stream: %x\n",
@@ -595,7 +598,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
 
   stream = data_s->req.protop;
   if(!stream) {
-    H2BUGF(infof(conn->data, "No proto pointer for stream: %x\n",
+    H2BUGF(infof(data_s, "No proto pointer for stream: %x\n",
                  stream_id));
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
@@ -623,8 +626,10 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
     }
 
     /* nghttp2 guarantees that :status is received, and we store it to
-       stream->status_code */
-    DEBUGASSERT(stream->status_code != -1);
+       stream->status_code. Fuzzing has proven this can still be reached
+       without status code having been set. */
+    if(stream->status_code == -1)
+      return NGHTTP2_ERR_CALLBACK_FAILURE;
 
     /* Only final status code signals the end of header */
     if(stream->status_code / 100 != 1) {
@@ -671,7 +676,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
     }
     break;
   default:
-    H2BUGF(infof(conn->data, "Got frame type %x for stream %u!\n",
+    H2BUGF(infof(data_s, "Got frame type %x for stream %u!\n",
                  frame->hd.type, stream_id));
     break;
   }
@@ -870,16 +875,12 @@ static int on_begin_headers(nghttp2_session *session,
     return 0;
   }
 
-  /* This is trailer HEADERS started.  Allocate buffer for them. */
-  H2BUGF(infof(data_s, "trailer field started\n"));
-
-  DEBUGASSERT(stream->trailer_recvbuf == NULL);
-
-  stream->trailer_recvbuf = Curl_add_buffer_init();
   if(!stream->trailer_recvbuf) {
-    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    stream->trailer_recvbuf = Curl_add_buffer_init();
+    if(!stream->trailer_recvbuf) {
+      return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
   }
-
   return 0;
 }
 
@@ -1109,7 +1110,6 @@ void Curl_http2_done(struct connectdata *conn, bool premature)
   struct http_conn *httpc = &conn->proto.httpc;
 
   if(http->header_recvbuf) {
-    H2BUGF(infof(data, "free header_recvbuf!!\n"));
     Curl_add_buffer_free(http->header_recvbuf);
     http->header_recvbuf = NULL; /* clear the pointer */
     Curl_add_buffer_free(http->trailer_recvbuf);
@@ -1280,7 +1280,7 @@ static int h2_process_pending_input(struct connectdata *conn,
   if(rv < 0) {
     failf(data,
           "h2_process_pending_input: nghttp2_session_mem_recv() returned "
-          "%d:%s\n", rv, nghttp2_strerror((int)rv));
+          "%zd:%s\n", rv, nghttp2_strerror((int)rv));
     *err = CURLE_RECV_ERROR;
     return -1;
   }
@@ -1379,8 +1379,16 @@ static ssize_t http2_handle_stream_close(struct connectdata *conn,
 
   /* Reset to FALSE to prevent infinite loop in readwrite_data function. */
   stream->closed = FALSE;
-  if(httpc->error_code != NGHTTP2_NO_ERROR) {
-    failf(data, "HTTP/2 stream %u was not closed cleanly: %s (err %d)",
+  if(httpc->error_code == NGHTTP2_REFUSED_STREAM) {
+    H2BUGF(infof(data, "REFUSED_STREAM (%d), try again on a new connection!\n",
+                 stream->stream_id));
+    connclose(conn, "REFUSED_STREAM"); /* don't use this anymore */
+    data->state.refused_stream = TRUE;
+    *err = CURLE_RECV_ERROR; /* trigger Curl_retry_request() later */
+    return -1;
+  }
+  else if(httpc->error_code != NGHTTP2_NO_ERROR) {
+    failf(data, "HTTP/2 stream %d was not closed cleanly: %s (err %u)",
           stream->stream_id, Curl_http2_strerror(httpc->error_code),
           httpc->error_code);
     *err = CURLE_HTTP2_STREAM;
@@ -1388,7 +1396,7 @@ static ssize_t http2_handle_stream_close(struct connectdata *conn,
   }
 
   if(!stream->bodystarted) {
-    failf(data, "HTTP/2 stream %u was closed cleanly, but before getting "
+    failf(data, "HTTP/2 stream %d was closed cleanly, but before getting "
           " all response header fields, treated as error",
           stream->stream_id);
     *err = CURLE_HTTP2_STREAM;
@@ -1544,7 +1552,7 @@ static ssize_t http2_recv(struct connectdata *conn, int sockindex,
     stream->pausedata += nread;
     stream->pauselen -= nread;
 
-    infof(data, "%zu data bytes written\n", nread);
+    infof(data, "%zd data bytes written\n", nread);
     if(stream->pauselen == 0) {
       H2BUGF(infof(data, "Unpaused by stream %u\n", stream->stream_id));
       DEBUGASSERT(httpc->pause_stream_id == stream->stream_id);
@@ -1607,9 +1615,9 @@ static ssize_t http2_recv(struct connectdata *conn, int sockindex,
       }
 
       if(nread == 0) {
-        failf(data, "Unexpected EOF");
-        *err = CURLE_RECV_ERROR;
-        return -1;
+        H2BUGF(infof(data, "end of stream\n"));
+        *err = CURLE_OK;
+        return 0;
       }
 
       H2BUGF(infof(data, "nread=%zd\n", nread));
@@ -1627,7 +1635,7 @@ static ssize_t http2_recv(struct connectdata *conn, int sockindex,
     rv = nghttp2_session_mem_recv(httpc->h2, (const uint8_t *)inbuf, nread);
 
     if(nghttp2_is_fatal((int)rv)) {
-      failf(data, "nghttp2_session_mem_recv() returned %d:%s\n",
+      failf(data, "nghttp2_session_mem_recv() returned %zd:%s\n",
             rv, nghttp2_strerror((int)rv));
       *err = CURLE_RECV_ERROR;
       return -1;
@@ -1855,8 +1863,11 @@ static ssize_t http2_send(struct connectdata *conn, int sockindex,
     return -1;
   }
 
-  /* Extract :method, :path from request line */
-  line_end = strstr(hdbuf, "\r\n");
+  /* Extract :method, :path from request line
+     We do line endings with CRLF so checking for CR is enough */
+  line_end = memchr(hdbuf, '\r', len);
+  if(!line_end)
+    goto fail;
 
   /* Method does not contain spaces */
   end = memchr(hdbuf, ' ', line_end - hdbuf);
@@ -1914,8 +1925,10 @@ static ssize_t http2_send(struct connectdata *conn, int sockindex,
 
     hdbuf = line_end + 2;
 
-    line_end = strstr(hdbuf, "\r\n");
-    if(line_end == hdbuf)
+    /* check for next CR, but only within the piece of data left in the given
+       buffer */
+    line_end = memchr(hdbuf, '\r', len - (hdbuf - (char *)mem));
+    if(!line_end || (line_end == hdbuf))
       goto fail;
 
     /* header continuation lines are not supported */
@@ -2027,7 +2040,7 @@ static ssize_t http2_send(struct connectdata *conn, int sockindex,
   }
 
   infof(conn->data, "Using Stream ID: %x (easy handle %p)\n",
-        stream_id, conn->data);
+        stream_id, (void *)conn->data);
   stream->stream_id = stream_id;
 
   /* this does not call h2_session_send() since there can not have been any
@@ -2124,8 +2137,8 @@ CURLcode Curl_http2_switched(struct connectdata *conn,
   if(result)
     return result;
 
-  httpc->recv_underlying = (recving)conn->recv[FIRSTSOCKET];
-  httpc->send_underlying = (sending)conn->send[FIRSTSOCKET];
+  httpc->recv_underlying = conn->recv[FIRSTSOCKET];
+  httpc->send_underlying = conn->send[FIRSTSOCKET];
   conn->recv[FIRSTSOCKET] = http2_recv;
   conn->send[FIRSTSOCKET] = http2_send;
 

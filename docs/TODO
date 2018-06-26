@@ -17,7 +17,6 @@
  All bugs documented in the KNOWN_BUGS document are subject for fixing!
 
  1. libcurl
- 1.1 Option to refuse usernames in URLs
  1.2 More data sharing
  1.3 struct lifreq
  1.4 signal-based resolver timeouts
@@ -38,11 +37,13 @@
  1.19 Timeout idle connections from the pool
  1.20 SRV and URI DNS records
  1.21 API for URL parsing/splitting
+ 1.22 CURLINFO_PAUSE_STATE
  1.23 Offer API to flush the connection pool
  1.24 TCP Fast Open for windows
  1.25 Expose tried IP addresses that failed
  1.26 CURL_REFUSE_CLEARTEXT
  1.27 hardcode the "localhost" addresses
+ 1.28 FD_CLOEXEC
 
  2. libcurl - multi interface
  2.1 More non-blocking
@@ -114,6 +115,7 @@
  13.11 Support intermediate & root pinning for PINNEDPUBLICKEY
  13.12 Support HSTS
  13.13 Support HPKP
+ 13.14 Support the clienthello extension
 
  14. GnuTLS
  14.1 SSL engine stuff
@@ -121,7 +123,6 @@
 
  15. WinSSL/SChannel
  15.1 Add support for client certificate authentication
- 15.2 Add support for custom server certificate validation
  15.3 Add support for the --ciphers option
 
  16. SASL
@@ -186,16 +187,6 @@
 ==============================================================================
 
 1. libcurl
-
-1.1 Option to refuse usernames in URLs
-
- There's a certain risk for application in allowing user names in URLs. For
- example: if the wrong person gets to set the URL and manages to set a user
- name in there when .netrc is used, the application may send along a password
- that otherwise the person couldn't provide.
-
- A new libcurl option could be added to allow applications to switch off this
- feature and thus avoid a potential risk.
 
 1.2 More data sharing
 
@@ -386,6 +377,11 @@
  using libcurl need that ability. In polls to users, we've learned that many
  libcurl users would like to see and use such an API.
 
+1.22 CURLINFO_PAUSE_STATE
+
+ Return information about the transfer's current pause state, in both
+ directions. https://github.com/curl/curl/issues/2588
+
 1.23 Offer API to flush the connection pool
 
  Sometimes applications want to flush all the existing connections kept alive.
@@ -430,6 +426,14 @@
  https://bugzilla.mozilla.org/show_bug.cgi?id=1220810
 
  https://tools.ietf.org/html/draft-ietf-dnsop-let-localhost-be-localhost-02
+
+1.28 FD_CLOEXEC
+
+ It sets the close-on-exec flag for the file descriptor, which causes the file
+ descriptor to be automatically (and atomically) closed when any of the
+ exec-family functions succeed. Should probably be set by default?
+
+ https://github.com/curl/curl/issues/2252
 
 2. libcurl - multi interface
 
@@ -799,6 +803,16 @@ that doesn't exist on the server, just like --ftp-create-dirs.
  Doc: https://developer.mozilla.org/de/docs/Web/Security/Public_Key_Pinning
  RFC: https://tools.ietf.org/html/draft-ietf-websec-key-pinning-21
 
+13.14 Support the clienthello extension
+
+ Certain stupid networks and middle boxes have a problem with SSL handshake
+ pakets that are within a certain size range because how that sets some bits
+ that previously (in older TLS version) were not set. The clienthello
+ extension adds padding to avoid that size range.
+
+ https://tools.ietf.org/html/rfc7685
+ https://github.com/curl/curl/issues/2299
+
 14. GnuTLS
 
 14.1 SSL engine stuff
@@ -819,17 +833,6 @@ that doesn't exist on the server, just like --ftp-create-dirs.
  or the user to supply a custom client certificate using curl or libcurl.
 
  Therefore support for the existing -E/--cert and --key options should be
- implemented by supplying a custom certificate to the SChannel APIs, see:
- - Getting a Certificate for Schannel
-   https://msdn.microsoft.com/en-us/library/windows/desktop/aa375447.aspx
-
-15.2 Add support for custom server certificate validation
-
- WinSSL/SChannel currently makes use of the OS-level system and user
- certificate trust store. This does not allow the application or user to
- customize the server certificate validation process using curl or libcurl.
-
- Therefore support for the existing --cacert or --capath options should be
  implemented by supplying a custom certificate to the SChannel APIs, see:
  - Getting a Certificate for Schannel
    https://msdn.microsoft.com/en-us/library/windows/desktop/aa375447.aspx
